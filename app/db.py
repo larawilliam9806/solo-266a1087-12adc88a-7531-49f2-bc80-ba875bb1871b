@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS trips (
     trip_id       TEXT NOT NULL,
     trip_headsign TEXT NOT NULL DEFAULT '',
     direction_id  INTEGER,
+    vehicle_id    TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (version_id, trip_id)
 );
 CREATE INDEX IF NOT EXISTS idx_trips_route ON trips (version_id, route_id);
@@ -118,9 +119,19 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """兼容旧库：早期版本的 trips 表没有 vehicle_id 列。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(trips)")}
+    if "vehicle_id" not in cols:
+        conn.execute("ALTER TABLE trips ADD COLUMN vehicle_id TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trips_vehicle "
+                 "ON trips (version_id, vehicle_id)")
 
 
 def current_version_id(conn: sqlite3.Connection) -> int | None:
@@ -152,7 +163,8 @@ def publish_version(conn: sqlite3.Connection, label: str,
             [(vid, *r) for r in tables["calendar"]])
         conn.executemany(
             "INSERT INTO trips (version_id, route_id, service_id, trip_id, "
-            "trip_headsign, direction_id) VALUES (?, ?, ?, ?, ?, ?)",
+            "trip_headsign, direction_id, vehicle_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             [(vid, *r) for r in tables["trips"]])
         conn.executemany(
             "INSERT INTO stop_times (version_id, trip_id, stop_sequence, stop_id, "

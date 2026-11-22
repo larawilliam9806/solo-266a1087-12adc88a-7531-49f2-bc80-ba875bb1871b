@@ -49,6 +49,7 @@
 <header><h1>🚌 公交 GTFS 时刻表发布系统</h1></header>
 <nav>
   <button data-tab="query" class="active">时刻查询</button>
+  <button data-tab="garage">车库</button>
   <button data-tab="publish">发布新版本</button>
   <button data-tab="versions">版本记录</button>
 </nav>
@@ -74,12 +75,34 @@
   </div>
 </section>
 
+<!-- ============ 车库 ============ -->
+<section id="tab-garage" class="panel">
+  <div class="card">
+    <h2>按车号和北京时间自然日查计划占用</h2>
+    <p class="muted">数据来自当前正式版。占用按「首站发车 → 末站到站」计算，
+      跨午夜运行会归到实际落在当天的时段，并标出原运营日。</p>
+    <div class="grid">
+      <div>
+        <label>车号</label>
+        <select id="g-vehicle"></select>
+      </div>
+      <div>
+        <label>北京时间自然日</label>
+        <input type="date" id="g-date">
+      </div>
+    </div>
+    <button class="primary" id="g-btn">查询</button>
+    <div id="g-result"></div>
+  </div>
+</section>
+
 <!-- ============ 发布 ============ -->
 <section id="tab-publish" class="panel">
   <div class="card">
     <h2>上传同一版本的 5 个 CSV</h2>
-    <p class="muted">整版校验（跨表引用、停站序号唯一、时刻递增、跨午夜时刻）全部通过才会发布；
-       任一错误都会保留当前正式版，并在此列出错误行。</p>
+    <p class="muted">整版校验（跨表引用、停站序号唯一、时刻递增、跨午夜时刻、同一车号的计划占用）全部通过才会发布；
+       任一错误都会保留当前正式版，并在此列出错误行。trips.csv 可选 <code>vehicle_id</code> 列，
+       留空则按原规则处理。</p>
     <label>版本名称</label>
     <input type="text" id="p-label" placeholder="例如 2026-冬季运行图 v2">
     <div class="grid">
@@ -115,6 +138,7 @@ document.querySelectorAll("nav button").forEach(btn => {
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "versions") loadVersions();
     if (btn.dataset.tab === "query") loadRoutes();
+    if (btn.dataset.tab === "garage") loadVehicles();
   };
 });
 
@@ -147,7 +171,8 @@ $("q-btn").onclick = async () => {
   box.innerHTML = `<p class="muted">版本 v${data.version_id} · ${data.date}（${data.weekday}）· 共 ${data.trip_count} 个班次</p>` +
     data.trips.map(t => `
       <div class="trip">
-        <h3>班次 ${t.trip_id}${t.headsign ? " · " + t.headsign : ""} <span class="muted">service: ${t.service_id}</span></h3>
+        <h3>班次 ${t.trip_id}${t.headsign ? " · " + t.headsign : ""}
+          <span class="muted">service: ${t.service_id}${t.vehicle_id ? " · 车号: " + t.vehicle_id : ""}</span></h3>
         <table>
           <tr><th>序号</th><th>站点</th><th>到站</th><th>发车</th></tr>
           ${t.stop_times.map(s => `<tr>
@@ -158,6 +183,51 @@ $("q-btn").onclick = async () => {
           </tr>`).join("")}
         </table>
       </div>`).join("");
+};
+
+// ---------- 车库 ----------
+$("g-date").value = new Date().toISOString().slice(0, 10);
+
+async function loadVehicles() {
+  const sel = $("g-vehicle");
+  try {
+    const res = await fetch("/api/vehicles");
+    const data = await res.json();
+    if (!res.ok) { sel.innerHTML = "<option value=''>（" + (data.detail || "无数据") + "）</option>"; return; }
+    if (!data.vehicles.length) {
+      sel.innerHTML = "<option value=''>（当前正式版没有填写车号）</option>"; return;
+    }
+    sel.innerHTML = data.vehicles.map(v => `<option value="${v}">${v}</option>`).join("");
+  } catch (e) { sel.innerHTML = "<option>加载失败</option>"; }
+}
+
+$("g-btn").onclick = async () => {
+  const vehicle = $("g-vehicle").value, date = $("g-date").value;
+  const box = $("g-result");
+  if (!vehicle || !date) { box.innerHTML = '<div class="banner err">请选择车号和日期</div>'; return; }
+  const res = await fetch(`/api/vehicles/${encodeURIComponent(vehicle)}/occupancy?date=${date}`);
+  const data = await res.json();
+  if (!res.ok) { box.innerHTML = `<div class="banner err">${data.detail || "查询失败"}</div>`; return; }
+  const src = `<p class="muted">来源：正式版 <b>v${data.version_id}</b>
+    「${data.version_label}」${data.version_published_at ? " · 发布于 " + data.version_published_at : ""}
+    · ${data.date}（北京时间）· 车号 <code>${data.vehicle_id}</code> · 共 ${data.occurrence_count} 段占用</p>`;
+  if (data.occurrence_count === 0) {
+    box.innerHTML = src + '<div class="banner ok">当天该车没有计划占用</div>';
+    return;
+  }
+  box.innerHTML = src + `<table>
+    <tr><th>占用时段（北京时间）</th><th>班次</th><th>线路</th><th>方向</th><th>原运营日</th></tr>
+    ${data.occurrences.map(o => `<tr>
+      <td>${o.overlap_start} ~ ${o.overlap_end}
+        ${o.crosses_midnight ? '<span class="nextday">跨午夜</span>' : ""}
+        ${o.start !== o.overlap_start || o.end !== o.overlap_end
+          ? `<div class="muted">完整占用 ${o.start} ~ ${o.end}</div>` : ""}</td>
+      <td>${o.trip_id}</td>
+      <td>${o.route_id}</td>
+      <td>${o.headsign || "-"}</td>
+      <td>${o.service_date}</td>
+    </tr>`).join("")}
+  </table>`;
 };
 
 // ---------- 发布 ----------

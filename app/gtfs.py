@@ -12,6 +12,11 @@
    每行 departure >= arrival，且下一站到站时刻 > 上一站发车时刻（严格递增）。
 5. 跨午夜：时刻允许 HH >= 24（如 25:10:00），统一换算为
    “自运营日 00:00 起的秒数”存储与比较。
+6. 车辆占用：trips.csv 可选 vehicle_id 列。同一车号的计划占用按
+   “首站发车 -> 末站到站”计算，允许首尾相接，单站班次不计；
+   按北京时间换算绝对时刻后检查重叠（含跨午夜，以及同一班次在不同
+   运营日的两次运行）。日历只按“起止日期 + 星期标志”做常数时间判定，
+   不逐日展开多年日历。
 """
 from __future__ import annotations
 
@@ -19,9 +24,11 @@ import csv
 import io
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 
 MAX_ERRORS = 1000  # 单版本最多记录的错误条数，防止超大错误响应
+
+DAY_SECS = 86400
 
 TIME_RE = re.compile(r"^(\d{1,3}):([0-5]\d):([0-5]\d)$")
 DATE_RE = re.compile(r"^\d{8}$")
@@ -80,6 +87,18 @@ def parse_service_date(value: str) -> date | None:
         return date(int(value[0:4]), int(value[4:6]), int(value[6:8]))
     except ValueError:
         return None
+
+
+def abs_secs(day: date, secs_of_day: int) -> int:
+    """运营日 + 自运营日 00:00 起的秒数 -> 绝对秒数（以北京时间自然日计）。"""
+    return day.toordinal() * DAY_SECS + secs_of_day
+
+
+def fmt_beijing(secs: int) -> str:
+    """绝对秒数（abs_secs 口径）-> 北京时间 'YYYY-MM-DD HH:MM:SS'。"""
+    day_no, rem = divmod(secs, DAY_SECS)
+    return (datetime.combine(date.fromordinal(day_no), datetime.min.time())
+            + timedelta(seconds=rem)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class _ErrorBag:
@@ -237,6 +256,8 @@ def validate_version(files: dict[str, bytes]) -> tuple[dict[str, list[tuple]] | 
     trip_ids: set[str] = set()
     trips_out: list[tuple] = []
     trip_route: dict[str, str] = {}
+    trip_service: dict[str, str] = {}
+    trip_vehicle: dict[str, str] = {}   # 仅记录显式填写车号的 trip
     if raw["trips"]:
         trip_ids = _check_unique(raw["trips"], "trips", "trip_id", bag)
         for r in raw["trips"]:
@@ -264,10 +285,15 @@ def validate_version(files: dict[str, bytes]) -> tuple[dict[str, list[tuple]] | 
                     bag.add("trips", r["_row"], "direction_id",
                             "direction_id 必须为 0 或 1")
                     ok = False
+            vehicle_id = r.get("vehicle_id", "")
             if ok and r["trip_id"] in trip_ids:
                 trips_out.append((r["route_id"], r["service_id"], r["trip_id"],
-                                  r.get("trip_headsign", ""), direction_val))
+                                  r.get("trip_headsign", ""), direction_val,
+                                  vehicle_id))
                 trip_route[r["trip_id"]] = r["route_id"]
+                trip_service[r["trip_id"]] = r["service_id"]
+                if vehicle_id:
+                    trip_vehicle[r["trip_id"]] = vehicle_id
 
     # ---------- stop_times ----------
     stop_times_out: list[tuple] = []
@@ -353,6 +379,12 @@ def validate_version(files: dict[str, bytes]) -> tuple[dict[str, list[tuple]] | 
                     bag.add("trips", r["_row"], "trip_id",
                             f"trip '{tid}' 没有任何 stop_times 记录")
 
+    # ---------- 车辆计划占用冲突 ----------
+    # 只有 trips.csv 提供了 vehicle_id 列且填了车号的班次才参与。
+    if not bag and trip_vehicle and raw["stop_times"] and raw["calendar"]:
+        _check_vehicle_conflicts(calendar_out, trip_vehicle, trip_service,
+                                 stop_times_out, bag)
+
     if bag:
         return None, [e.as_dict() for e in bag.errors], bag.truncated
 
@@ -364,3 +396,118 @@ def validate_version(files: dict[str, bytes]) -> tuple[dict[str, list[tuple]] | 
         "stop_times": stop_times_out,
     }
     return tables, [], False
+
+
+def _check_vehicle_conflicts(
+    calendar_out: list[tuple],
+    trip_vehicle: dict[str, str],
+    trip_service: dict[str, str],
+    stop_times_out: list[tuple],
+    bag: _ErrorBag,
+) -> None:
+    """检查同一车号的计划占用是否重叠。
+
+    占用区间 = 首站发车时刻 -> 末站到站时刻（GTFS 秒数，可跨午夜）。
+    单站班次不计。比较前把「运营日 + 日内秒数」换算成绝对秒数，
+    从而正确覆盖跨午夜、以及同一班次在不同运营日的两次运行。
+
+    日历处理：直接对日历判定，不逐日展开全期。同一车号的两个班次
+    若运行窗口相交于某一运营日，则各自取「最早的重叠有效运营日」——
+    星期图案每 7 天重复一次，因此只需在前 7 天里定位。
+    """
+    # trip_id -> (首站发车秒, 末站到站秒)
+    window: dict[str, tuple[int, int]] = {}
+    grouped: dict[str, list[tuple[int, int, int]]] = {}
+    for trip_id, seq, _stop, arr, dep in stop_times_out:
+        grouped.setdefault(trip_id, []).append((seq, arr, dep))
+    for trip_id, recs in grouped.items():
+        if len(recs) < 2:          # 单站班次：不计计划占用
+            continue
+        recs.sort()
+        window[trip_id] = (recs[0][2], recs[-1][1])
+
+    cal: dict[str, tuple[date, date, tuple[bool, ...]]] = {}
+    for svc, *rest in calendar_out:
+        cal[svc] = (date.fromisoformat(rest[7]), date.fromisoformat(rest[8]),
+                    tuple(bool(x) for x in rest[:7]))
+
+    by_vehicle: dict[str, list[tuple[str, int, int, str]]] = {}
+    for trip_id, vehicle_id in trip_vehicle.items():
+        win = window.get(trip_id)
+        svc = trip_service.get(trip_id)
+        if win is None or svc not in cal:
+            continue
+        by_vehicle.setdefault(vehicle_id, []).append(
+            (trip_id, win[0], win[1], svc))
+
+    for vehicle_id, runs in sorted(by_vehicle.items()):
+        runs.sort(key=lambda r: (r[0], r[3]))
+        for i in range(len(runs)):
+            trip_a, start_a, end_a, svc_a = runs[i]
+            # j 从 i 开始：同一班次在不同运营日的两次运行也要比较。
+            for j in range(i, len(runs)):
+                trip_b, start_b, end_b, svc_b = runs[j]
+                same_run = (trip_a == trip_b and svc_a == svc_b)
+                hit = _first_overlap(cal[svc_a], start_a, end_a,
+                                     cal[svc_b], start_b, end_b,
+                                     allow_same_day=not same_run)
+                if hit is not None:
+                    d_a, d_b, lo, hi = hit
+                    bag.add("trips", None, "vehicle_id", (
+                        f"车辆 '{vehicle_id}' 计划占用冲突：班次 '{trip_a}'"
+                        f"（运营日 {d_a.isoformat()}）与班次 '{trip_b}'"
+                        f"（运营日 {d_b.isoformat()}）重叠，实际重叠时段 "
+                        f"{fmt_beijing(lo)} 至 {fmt_beijing(hi)}（北京时间）"))
+                    return  # 指出一处冲突即可，整版拒绝
+
+
+def _first_overlap(cal_a, start_a, end_a, cal_b, start_b, end_b,
+                   allow_same_day: bool = True):
+    """两个班次各自按日历反复运行时，是否存在一次占用重叠。
+
+    cal_x = (start_date, end_date, weekday_flags)；
+    返回 (a 的运营日, b 的运营日, 重叠开始绝对秒, 重叠结束绝对秒) 或 None。
+    首尾相接（恰好等于）不算冲突。全部为常数次比较，与日历跨度无关。
+    """
+    a_start, a_end, flags_a = cal_a
+    b_start, b_end, flags_b = cal_b
+
+    def intersect_on(d_a: date, d_b: date):
+        lo = max(abs_secs(d_a, start_a), abs_secs(d_b, start_b))
+        hi = min(abs_secs(d_a, end_a), abs_secs(d_b, end_b))
+        return (lo, hi) if lo < hi else None
+
+    # delta = d_b - d_a。窗口跨度决定需要考察哪些天差；普通班次
+    # 短于 24 小时，只可能是 -1/0/+1。同一班次在不同运营日的两次运行
+    # 要比较，但同一天的同一次运行不能和自己比（delta=0 跳过）。
+    span_days = max((end_a - start_a), (end_b - start_b)) // DAY_SECS
+    for delta in range(-span_days - 1, span_days + 2):
+        if delta == 0 and not allow_same_day:
+            continue
+        # 求使 d_a、d_b = d_a + delta 均有效的最早 d_a。
+        lo = max(a_start, b_start - timedelta(days=delta))
+        hi = min(a_end, b_end - timedelta(days=delta))
+        if lo > hi:
+            continue
+        # 星期图案 7 天重复：在 [lo, hi] 前 7 天里找最早的有效 d_a。
+        d_a = _first_valid_day(flags_a, flags_b, delta, lo, hi)
+        if d_a is None:
+            continue
+        d_b = d_a + timedelta(days=delta)
+        found = intersect_on(d_a, d_b)
+        if found:
+            return d_a, d_b, found[0], found[1]
+    return None
+
+
+def _first_valid_day(flags_a, flags_b, delta: int, lo: date, hi: date):
+    """在 [lo, hi] 内找最早的 d_a，使 a(d_a) 与 b(d_a+delta) 都为有效服务日。"""
+    for k in range(7):
+        d_a = lo + timedelta(days=k)
+        if d_a > hi:
+            return None
+        d_b = d_a + timedelta(days=delta)
+        if flags_a[d_a.weekday()] and flags_b[d_b.weekday()]:
+            return d_a
+    # 7 天内必有候选；若窗口 < 7 天且没命中，则确实没有有效日。
+    return None

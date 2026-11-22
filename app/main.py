@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import date as date_type
+from datetime import date as date_type, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -10,7 +10,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .gtfs import WEEKDAY_COLUMNS, format_gtfs_time, validate_version
+from .gtfs import (DAY_SECS, WEEKDAY_COLUMNS, fmt_beijing,
+                   format_gtfs_time, validate_version)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -173,7 +174,8 @@ def route_schedule(
         if service_ids:
             placeholders = ",".join("?" for _ in service_ids)
             trips = conn.execute(
-                f"SELECT trip_id, service_id, trip_headsign, direction_id "
+                f"SELECT trip_id, service_id, trip_headsign, direction_id, "
+                f"vehicle_id "
                 f"FROM trips WHERE version_id = ? AND route_id = ? "
                 f"AND service_id IN ({placeholders})",
                 (vid, route_id, *service_ids)).fetchall()
@@ -191,6 +193,7 @@ def route_schedule(
                     "service_id": t["service_id"],
                     "headsign": t["trip_headsign"],
                     "direction_id": t["direction_id"],
+                    "vehicle_id": t["vehicle_id"] or None,
                     "stop_times": [_stop_time_dict(s) for s in stops],
                 })
             trips_out.sort(
@@ -223,6 +226,125 @@ def _stop_time_dict(row) -> dict:
         "departure_day_offset": dep // 86400,
         "arrival_clock": format_gtfs_time(arr % 86400),
         "departure_clock": format_gtfs_time(dep % 86400),
+    }
+
+
+# ---------------- 车库：按车号 + 北京时间自然日查正式版 ----------------
+
+def _abs(day: date_type, secs_of_day: int) -> int:
+    return day.toordinal() * DAY_SECS + secs_of_day
+
+
+@app.get("/api/vehicles")
+def list_vehicles():
+    """当前正式版中出现过的车号。"""
+    conn = db.connect()
+    try:
+        vid = _require_current(conn)
+        rows = conn.execute(
+            "SELECT DISTINCT vehicle_id FROM trips "
+            "WHERE version_id = ? AND vehicle_id <> '' ORDER BY vehicle_id",
+            (vid,)).fetchall()
+    finally:
+        conn.close()
+    return {"version_id": vid, "vehicles": [r["vehicle_id"] for r in rows]}
+
+
+@app.get("/api/vehicles/{vehicle_id}/occupancy")
+def vehicle_occupancy(
+    vehicle_id: str,
+    date: str = Query(..., description="北京时间的自然日，格式 YYYY-MM-DD"),
+):
+    """某车号在指定北京时间自然日的计划占用（读当前正式版）。
+
+    计划占用按「首站发车 -> 末站到站」计算，与发布前核验口径一致；
+    单站班次不计。跨午夜的占用会归到实际落在当天的时段，同时给出
+    该次运行的原运营日。
+    """
+    try:
+        day = date_type.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(422, f"date '{date}' 不是合法的 YYYY-MM-DD 日期")
+
+    day_lo = _abs(day, 0)
+    day_hi = day_lo + DAY_SECS
+
+    conn = db.connect()
+    try:
+        vid = _require_current(conn)
+        version = conn.execute(
+            "SELECT id, label, published_at FROM versions WHERE id = ?",
+            (vid,)).fetchone()
+        trips = conn.execute(
+            "SELECT trip_id, route_id, service_id, trip_headsign, vehicle_id "
+            "FROM trips WHERE version_id = ? AND vehicle_id = ? "
+            "ORDER BY trip_id", (vid, vehicle_id)).fetchall()
+        if not trips:
+            raise HTTPException(
+                404, f"车号 '{vehicle_id}' 在当前正式版 v{vid} 中不存在")
+
+        calendars = {r["service_id"]: r for r in conn.execute(
+            "SELECT service_id, monday, tuesday, wednesday, thursday, friday, "
+            "saturday, sunday, start_date, end_date "
+            "FROM calendar WHERE version_id = ?", (vid,)).fetchall()}
+
+        occurrences = []
+        for t in trips:
+            cal = calendars.get(t["service_id"])
+            if cal is None:
+                continue
+            stops = conn.execute(
+                "SELECT st.stop_sequence, st.stop_id, s.stop_name, "
+                "st.arrival_secs, st.departure_secs "
+                "FROM stop_times st JOIN stops s "
+                "  ON s.version_id = st.version_id AND s.stop_id = st.stop_id "
+                "WHERE st.version_id = ? AND st.trip_id = ? "
+                "ORDER BY st.stop_sequence",
+                (vid, t["trip_id"])).fetchall()
+            if len(stops) < 2:      # 单站班次不计计划占用
+                continue
+            start_s = stops[0]["departure_secs"]
+            end_s = stops[-1]["arrival_secs"]
+
+            # 占用可能长达数天：从目标日往前最多 (跨度天数+1) 天开始找
+            span_days = (end_s - start_s) // DAY_SECS
+            flags = [cal[c] for c in WEEKDAY_COLUMNS]
+            for back in range(span_days + 2):
+                svc_day = day - timedelta(days=back)
+                iso = svc_day.isoformat()
+                if not (cal["start_date"] <= iso <= cal["end_date"]):
+                    continue
+                if not flags[svc_day.weekday()]:
+                    continue
+                start_abs = _abs(svc_day, start_s)
+                end_abs = _abs(svc_day, end_s)
+                if start_abs >= day_hi or end_abs <= day_lo:
+                    continue
+                clip_lo, clip_hi = max(start_abs, day_lo), min(end_abs, day_hi)
+                occurrences.append({
+                    "trip_id": t["trip_id"],
+                    "route_id": t["route_id"],
+                    "service_id": t["service_id"],
+                    "headsign": t["trip_headsign"],
+                    "service_date": iso,          # 原运营日
+                    "start": fmt_beijing(start_abs),
+                    "end": fmt_beijing(end_abs),
+                    "overlap_start": fmt_beijing(clip_lo),
+                    "overlap_end": fmt_beijing(clip_hi),
+                    "crosses_midnight": start_abs // DAY_SECS != end_abs // DAY_SECS,
+                })
+    finally:
+        conn.close()
+
+    occurrences.sort(key=lambda o: (o["start"], o["trip_id"]))
+    return {
+        "version_id": vid,
+        "version_label": version["label"],
+        "version_published_at": version["published_at"],
+        "vehicle_id": vehicle_id,
+        "date": date,
+        "occurrence_count": len(occurrences),
+        "occurrences": occurrences,
     }
 
 
